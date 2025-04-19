@@ -2,6 +2,22 @@
 set -eo pipefail
 
 echo "Starting OpenHands..."
+
+# Normalize workspace paths
+if [ -n "$WORKSPACE_MOUNT_PATH" ]; then
+  # Remove any leading dash and trailing brace
+  WORKSPACE_MOUNT_PATH=$(echo "$WORKSPACE_MOUNT_PATH" | sed 's/^-\/*//;s/}$//')
+  
+  # Ensure path starts with /
+  if [[ "$WORKSPACE_MOUNT_PATH" != /* ]]; then
+    WORKSPACE_MOUNT_PATH="/$WORKSPACE_MOUNT_PATH"
+  fi
+  
+  # Set the normalized path
+  export WORKSPACE_MOUNT_PATH
+  export WORKSPACE_BASE="/opt/workspace_base"
+fi
+
 if [[ $NO_SETUP == "true" ]]; then
   echo "Skipping setup, running as $(whoami)"
   "$@"
