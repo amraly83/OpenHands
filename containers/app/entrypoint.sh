@@ -4,18 +4,37 @@ set -eo pipefail
 echo "Starting OpenHands..."
 
 # Normalize workspace paths
-if [ -n "$WORKSPACE_MOUNT_PATH" ]; then
+if [ -n "$WORKSPACE_BASE" ]; then
+  # Evaluate any $PWD or other variables in the path
+  WORKSPACE_BASE=$(eval echo "$WORKSPACE_BASE")
+  
   # Remove any leading dash and trailing brace
-  WORKSPACE_MOUNT_PATH=$(echo "$WORKSPACE_MOUNT_PATH" | sed 's/^-\/*//;s/}$//')
+  WORKSPACE_BASE=$(echo "$WORKSPACE_BASE" | sed 's/^-\/*//;s/}$//')
   
   # Ensure path starts with /
-  if [[ "$WORKSPACE_MOUNT_PATH" != /* ]]; then
-    WORKSPACE_MOUNT_PATH="/$WORKSPACE_MOUNT_PATH"
+  if [[ "$WORKSPACE_BASE" != /* ]]; then
+    WORKSPACE_BASE="/$WORKSPACE_BASE"
   fi
   
-  # Set the normalized path
-  export WORKSPACE_MOUNT_PATH
-  export WORKSPACE_BASE="/opt/workspace_base"
+  # Set the normalized paths
+  export WORKSPACE_BASE
+  export WORKSPACE_MOUNT_PATH="$WORKSPACE_BASE"
+fi
+
+# Normalize OpenHands state path
+if [ -n "$OPENHANDS_STATE_PATH" ]; then
+  # Evaluate any ~ or other variables in the path
+  OPENHANDS_STATE_PATH=$(eval echo "$OPENHANDS_STATE_PATH")
+  
+  # Remove any leading dash and trailing brace
+  OPENHANDS_STATE_PATH=$(echo "$OPENHANDS_STATE_PATH" | sed 's/^-\/*//;s/}$//')
+  
+  # Ensure path starts with /
+  if [[ "$OPENHANDS_STATE_PATH" != /* ]]; then
+    OPENHANDS_STATE_PATH="/$OPENHANDS_STATE_PATH"
+  fi
+  
+  export OPENHANDS_STATE_PATH
 fi
 
 if [[ $NO_SETUP == "true" ]]; then
