@@ -3,44 +3,35 @@ set -eo pipefail
 
 echo "Starting OpenHands..."
 
+# Function to normalize paths that Coolify might transform
+normalize_path() {
+    local path=$1
+    # Remove leading dash and trailing brace that Coolify adds
+    path=$(echo "$path" | sed 's/^-\/*//;s/}$//')
+    # Ensure path starts with /
+    if [[ "$path" != /* ]]; then
+        path="/$path"
+    fi
+    echo "$path"
+}
+
 # Normalize workspace paths
 if [ -n "$WORKSPACE_BASE" ]; then
-  # Evaluate any $PWD or other variables in the path
-  WORKSPACE_BASE=$(eval echo "$WORKSPACE_BASE")
-  
-  # Remove any leading dash and trailing brace
-  WORKSPACE_BASE=$(echo "$WORKSPACE_BASE" | sed 's/^-\/*//;s/}$//')
-  
-  # Ensure path starts with /
-  if [[ "$WORKSPACE_BASE" != /* ]]; then
-    WORKSPACE_BASE="/$WORKSPACE_BASE"
-  fi
-  
-  # Set the normalized paths
-  export WORKSPACE_BASE
-  export WORKSPACE_MOUNT_PATH="$WORKSPACE_BASE"
+    WORKSPACE_BASE=$(normalize_path "$WORKSPACE_BASE")
+    export WORKSPACE_BASE
+    export WORKSPACE_MOUNT_PATH="$WORKSPACE_BASE"
 fi
 
 # Normalize OpenHands state path
 if [ -n "$OPENHANDS_STATE_PATH" ]; then
-  # Evaluate any ~ or other variables in the path
-  OPENHANDS_STATE_PATH=$(eval echo "$OPENHANDS_STATE_PATH")
-  
-  # Remove any leading dash and trailing brace
-  OPENHANDS_STATE_PATH=$(echo "$OPENHANDS_STATE_PATH" | sed 's/^-\/*//;s/}$//')
-  
-  # Ensure path starts with /
-  if [[ "$OPENHANDS_STATE_PATH" != /* ]]; then
-    OPENHANDS_STATE_PATH="/$OPENHANDS_STATE_PATH"
-  fi
-  
-  export OPENHANDS_STATE_PATH
+    OPENHANDS_STATE_PATH=$(normalize_path "$OPENHANDS_STATE_PATH")
+    export OPENHANDS_STATE_PATH
 fi
 
 if [[ $NO_SETUP == "true" ]]; then
-  echo "Skipping setup, running as $(whoami)"
-  "$@"
-  exit 0
+    echo "Skipping setup, running as $(whoami)"
+    "$@"
+    exit 0
 fi
 
 if [ "$(id -u)" -ne 0 ]; then
