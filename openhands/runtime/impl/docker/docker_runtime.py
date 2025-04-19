@@ -1,6 +1,7 @@
 import os
+import asyncio
 from functools import lru_cache
-from typing import Callable
+from typing import Callable, Dict, Any
 from uuid import UUID
 
 import docker
@@ -50,6 +51,8 @@ def _is_retryable_wait_until_alive_error(exception):
             httpx.NetworkError,
             httpx.RemoteProtocolError,
             httpx.HTTPStatusError,
+            httpx.ConnectTimeout,  # Added ConnectTimeout explicitly
+            docker.errors.NotFound,  # Added NotFound for container startup race conditions
         ),
     )
 
@@ -138,38 +141,50 @@ class DockerRuntime(ActionExecutionClient):
 
     async def connect(self):
         self.send_status_message('STATUS$STARTING_RUNTIME')
-        try:
-            await call_sync_from_async(self._attach_to_container)
-        except docker.errors.NotFound as e:
-            if self.attach_to_existing:
-                self.log(
-                    'error',
-                    f'Container {self.container_name} not found.',
-                )
-                raise AgentRuntimeDisconnectedError from e
-            if self.runtime_container_image is None:
-                if self.base_container_image is None:
-                    raise ValueError(
-                        'Neither runtime container image nor base container image is set'
-                    )
-                self.send_status_message('STATUS$STARTING_CONTAINER')
-                self.runtime_container_image = build_runtime_image(
-                    self.base_container_image,
-                    self.runtime_builder,
-                    platform=self.config.sandbox.platform,
-                    extra_deps=self.config.sandbox.runtime_extra_deps,
-                    force_rebuild=self.config.sandbox.force_rebuild_runtime,
-                    extra_build_args=self.config.sandbox.runtime_extra_build_args,
-                )
+        max_retries = 3
+        retry_count = 0
 
-            self.log(
-                'info', f'Starting runtime with image: {self.runtime_container_image}'
-            )
-            await call_sync_from_async(self._init_container)
-            self.log(
-                'info',
-                f'Container started: {self.container_name}. VSCode URL: {self.vscode_url}',
-            )
+        while retry_count < max_retries:
+            try:
+                await call_sync_from_async(self._attach_to_container)
+                break
+            except (docker.errors.NotFound, httpx.ConnectTimeout) as e:
+                retry_count += 1
+                if retry_count >= max_retries or self.attach_to_existing:
+                    if self.attach_to_existing:
+                        self.log(
+                            'error',
+                            f'Container {self.container_name} not found.',
+                        )
+                        raise AgentRuntimeDisconnectedError from e
+
+                    # Initialize new container if needed
+                    if self.runtime_container_image is None:
+                        if self.base_container_image is None:
+                            raise ValueError(
+                                'Neither runtime container image nor base container image is set'
+                            )
+                        self.send_status_message('STATUS$STARTING_CONTAINER')
+                        self.runtime_container_image = build_runtime_image(
+                            self.base_container_image,
+                            self.runtime_builder,
+                            platform=self.config.sandbox.platform,
+                            extra_deps=self.config.sandbox.runtime_extra_deps,
+                            force_rebuild=self.config.sandbox.force_rebuild_runtime,
+                            extra_build_args=self.config.sandbox.runtime_extra_build_args,
+                        )
+
+                    self.log(
+                        'info', f'Starting runtime with image: {self.runtime_container_image}'
+                    )
+                    await call_sync_from_async(self._init_container)
+                    self.log(
+                        'info',
+                        f'Container started: {self.container_name}. VSCode URL: {self.vscode_url}',
+                    )
+                else:
+                    self.log('warning', f'Connection attempt {retry_count} failed, retrying...')
+                    await asyncio.sleep(2 ** retry_count)  # Exponential backoff
 
         if DEBUG_RUNTIME:
             self.log_streamer = LogStreamer(self.container, self.log)
@@ -207,29 +222,68 @@ class DockerRuntime(ActionExecutionClient):
             )
             raise ex
 
+    @tenacity.retry(
+        stop=tenacity.stop_after_delay(180) | stop_if_should_exit(),  # Increased from 120 to 180 seconds
+        retry=tenacity.retry_if_exception(_is_retryable_wait_until_alive_error),
+        reraise=True,
+        wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),  # Changed to exponential backoff
+    )
+    def _wait_until_alive(self):
+        try:
+            container = self.docker_client.containers.get(self.container_name)
+            if container.status == 'exited':
+                logs = container.logs(tail=50).decode('utf-8')
+                raise AgentRuntimeDisconnectedError(
+                    f'Container {self.container_name} has exited. Last logs:\n{logs}'
+                )
+            
+            # Check container network settings
+            network_settings = container.attrs.get('NetworkSettings', {})
+            if not network_settings.get('IPAddress'):
+                self.log('warning', 'Container has no IP address assigned, may indicate network issues')
+            
+            self.check_if_alive()
+            
+        except docker.errors.NotFound:
+            raise AgentRuntimeNotFoundError(
+                f'Container {self.container_name} not found.'
+            )
+        except Exception as e:
+            self.log('error', f'Error checking container status: {str(e)}')
+            raise
+
     def _init_container(self):
         self.log('debug', 'Preparing to start container...')
         self.send_status_message('STATUS$PREPARING_CONTAINER')
-        self._host_port = self._find_available_port(EXECUTION_SERVER_PORT_RANGE)
-        self._container_port = self._host_port
-        self._vscode_port = self._find_available_port(VSCODE_PORT_RANGE)
-        self._app_ports = [
-            self._find_available_port(APP_PORT_RANGE_1),
-            self._find_available_port(APP_PORT_RANGE_2),
-        ]
-        self.api_url = f'{self.config.sandbox.local_runtime_url}:{self._container_port}'
-
+        
+        # Set up network configuration first
         use_host_network = self.config.sandbox.use_host_network
         network_mode: str | None = 'host' if use_host_network else None
 
-        # Initialize port mappings
+        # Initialize port mappings with improved error handling
         port_mapping: dict[str, list[dict[str, str]]] | None = None
+        try:
+            self._host_port = self._find_available_port(EXECUTION_SERVER_PORT_RANGE)
+            self._container_port = self._host_port
+            self._vscode_port = self._find_available_port(VSCODE_PORT_RANGE)
+            self._app_ports = [
+                self._find_available_port(APP_PORT_RANGE_1),
+                self._find_available_port(APP_PORT_RANGE_2),
+            ]
+        except Exception as e:
+            self.log('error', f'Failed to allocate ports: {str(e)}')
+            raise
+
+        self.api_url = f'{self.config.sandbox.local_runtime_url}:{self._container_port}'
+
         if not use_host_network:
+            # Ensure we bind to localhost first for better security
+            bind_address = self.config.sandbox.runtime_binding_address or '127.0.0.1'
             port_mapping = {
                 f'{self._container_port}/tcp': [
                     {
                         'HostPort': str(self._host_port),
-                        'HostIp': self.config.sandbox.runtime_binding_address,
+                        'HostIp': bind_address,
                     }
                 ],
             }
@@ -238,7 +292,7 @@ class DockerRuntime(ActionExecutionClient):
                 port_mapping[f'{self._vscode_port}/tcp'] = [
                     {
                         'HostPort': str(self._vscode_port),
-                        'HostIp': self.config.sandbox.runtime_binding_address,
+                        'HostIp': bind_address,
                     }
                 ]
 
@@ -246,7 +300,7 @@ class DockerRuntime(ActionExecutionClient):
                 port_mapping[f'{port}/tcp'] = [
                     {
                         'HostPort': str(port),
-                        'HostIp': self.config.sandbox.runtime_binding_address,
+                        'HostIp': bind_address,
                     }
                 ]
         else:
@@ -255,15 +309,24 @@ class DockerRuntime(ActionExecutionClient):
                 'Using host network mode. If you are using MacOS, please make sure you have the latest version of Docker Desktop and enabled host network feature: https://docs.docker.com/network/drivers/host/#docker-desktop',
             )
 
-        # Combine environment variables
+        # Combine environment variables with improved networking configuration
         environment = {
             'port': str(self._container_port),
             'PYTHONUNBUFFERED': '1',
             'VSCODE_PORT': str(self._vscode_port),
             'PIP_BREAK_SYSTEM_PACKAGES': '1',
+            'HOST_HOSTNAME': 'host.docker.internal',  # Ensure host hostname is set
+            'DOCKER_DEFAULT_PLATFORM': self.config.sandbox.platform or 'linux/amd64',
+            'DOCKER_BUILDKIT': '1',
         }
+        
         if self.config.debug or DEBUG:
             environment['DEBUG'] = 'true'
+            environment['DOCKER_BUILDKIT_PROGRESS'] = 'plain'
+            
+        # Add host.docker.internal mapping for non-Windows platforms
+        extra_hosts = {'host.docker.internal': 'host-gateway'}
+        
         # also update with runtime_startup_env_vars
         environment.update(self.config.sandbox.runtime_startup_env_vars)
 
@@ -309,6 +372,7 @@ class DockerRuntime(ActionExecutionClient):
                 detach=True,
                 environment=environment,
                 volumes=volumes,
+                extra_hosts=extra_hosts,  # Add host mapping
                 device_requests=(
                     [docker.types.DeviceRequest(capabilities=[['gpu']], count=-1)]
                     if self.config.sandbox.enable_gpu
@@ -317,7 +381,15 @@ class DockerRuntime(ActionExecutionClient):
                 **(self.config.sandbox.docker_runtime_kwargs or {}),
             )
             self.log('debug', f'Container started. Server url: {self.api_url}')
+            
+            # Verify container networking
+            if not network_mode == 'host':
+                container_info = self.container.attrs
+                container_ip = container_info['NetworkSettings']['IPAddress']
+                self.log('debug', f'Container IP: {container_ip}')
+                
             self.send_status_message('STATUS$CONTAINER_STARTED')
+            
         except docker.errors.APIError as e:
             if '409' in str(e):
                 self.log(
@@ -372,26 +444,6 @@ class DockerRuntime(ActionExecutionClient):
             'debug',
             f'attached to container: {self.container_name} {self._container_port} {self.api_url}',
         )
-
-    @tenacity.retry(
-        stop=tenacity.stop_after_delay(120) | stop_if_should_exit(),
-        retry=tenacity.retry_if_exception(_is_retryable_wait_until_alive_error),
-        reraise=True,
-        wait=tenacity.wait_fixed(2),
-    )
-    def _wait_until_alive(self):
-        try:
-            container = self.docker_client.containers.get(self.container_name)
-            if container.status == 'exited':
-                raise AgentRuntimeDisconnectedError(
-                    f'Container {self.container_name} has exited.'
-                )
-        except docker.errors.NotFound:
-            raise AgentRuntimeNotFoundError(
-                f'Container {self.container_name} not found.'
-            )
-
-        self.check_if_alive()
 
     def close(self, rm_all_containers: bool | None = None):
         """Closes the DockerRuntime and associated objects
