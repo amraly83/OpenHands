@@ -96,7 +96,20 @@ class DockerRuntime(ActionExecutionClient):
         self._vscode_port = -1
         self._app_ports: list[int] = []
 
-        if os.environ.get('DOCKER_HOST_ADDR'):
+        # Set default local runtime URL if not specified
+        if not os.environ.get('DOCKER_HOST_ADDR'):
+            # Try to determine the best local address for Docker communication
+            if os.name == 'nt':  # Windows
+                self.config.sandbox.local_runtime_url = 'http://host.docker.internal'
+            else:
+                # For Linux/Mac, try to get the Docker bridge network gateway
+                try:
+                    bridge_ip = self.docker_client.networks.get('bridge').attrs['IPAM']['Config'][0]['Gateway']
+                    self.config.sandbox.local_runtime_url = f'http://{bridge_ip}'
+                except Exception:
+                    # Fallback to localhost/127.0.0.1 if bridge network info not available
+                    self.config.sandbox.local_runtime_url = 'http://127.0.0.1'
+        else:
             logger.info(
                 f'Using DOCKER_HOST_IP: {os.environ["DOCKER_HOST_ADDR"]} for local_runtime_url'
             )
@@ -223,10 +236,10 @@ class DockerRuntime(ActionExecutionClient):
             raise ex
 
     @tenacity.retry(
-        stop=tenacity.stop_after_delay(180) | stop_if_should_exit(),  # Increased from 120 to 180 seconds
+        stop=tenacity.stop_after_delay(180) | stop_if_should_exit(),
         retry=tenacity.retry_if_exception(_is_retryable_wait_until_alive_error),
         reraise=True,
-        wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),  # Changed to exponential backoff
+        wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
     )
     def _wait_until_alive(self):
         try:
@@ -237,11 +250,22 @@ class DockerRuntime(ActionExecutionClient):
                     f'Container {self.container_name} has exited. Last logs:\n{logs}'
                 )
             
-            # Check container network settings
+            # Check container network settings and DNS resolution
             network_settings = container.attrs.get('NetworkSettings', {})
             if not network_settings.get('IPAddress'):
-                self.log('warning', 'Container has no IP address assigned, may indicate network issues')
-            
+                # Try to ping the container to verify connectivity
+                try:
+                    container.exec_run('ping -c 1 host.docker.internal', privileged=True)
+                    self.log('debug', 'Successfully verified host.docker.internal DNS resolution')
+                except Exception as e:
+                    self.log('warning', f'DNS resolution test failed: {str(e)}. Using fallback configuration.')
+                    # Update API URL to use container IP if available
+                    container_ip = network_settings.get('Gateway')
+                    if container_ip:
+                        self.api_url = f'http://{container_ip}:{self._container_port}'
+                        self.log('debug', f'Updated API URL to use container gateway: {self.api_url}')
+
+            self.log('debug', f'Attempting to connect to runtime at {self.api_url}')
             self.check_if_alive()
             
         except docker.errors.NotFound:
@@ -256,9 +280,30 @@ class DockerRuntime(ActionExecutionClient):
         self.log('debug', 'Preparing to start container...')
         self.send_status_message('STATUS$PREPARING_CONTAINER')
         
-        # Set up network configuration first
+        # Determine optimal network mode based on platform and Docker version
         use_host_network = self.config.sandbox.use_host_network
-        network_mode: str | None = 'host' if use_host_network else None
+        network_mode = None
+        
+        if use_host_network:
+            network_mode = 'host'
+        else:
+            # Check if we're on Docker Desktop which supports host.docker.internal
+            try:
+                version_info = self.docker_client.version()
+                is_docker_desktop = any('docker-desktop' in component.get('Name', '').lower() 
+                                     for component in version_info.get('Components', []))
+                
+                if is_docker_desktop:
+                    # Docker Desktop supports host.docker.internal out of the box
+                    network_mode = 'bridge'
+                else:
+                    # For other Docker installations, we need to handle host resolution
+                    network_mode = 'bridge'
+                    extra_hosts = {'host.docker.internal': 'host-gateway'}
+                
+            except Exception as e:
+                self.log('warning', f'Failed to detect Docker environment: {str(e)}. Using default bridge network.')
+                network_mode = 'bridge'
 
         # Initialize port mappings with improved error handling
         port_mapping: dict[str, list[dict[str, str]]] | None = None
@@ -274,10 +319,23 @@ class DockerRuntime(ActionExecutionClient):
             self.log('error', f'Failed to allocate ports: {str(e)}')
             raise
 
-        self.api_url = f'{self.config.sandbox.local_runtime_url}:{self._container_port}'
+        # Verify host.docker.internal resolution before proceeding
+        try:
+            # Try to resolve the container's hostname first
+            hostname = None
+            if os.name == 'nt':  # Windows
+                hostname = 'host.docker.internal'
+            else:
+                hostname = self.config.sandbox.local_runtime_url.split('://')[-1].split(':')[0]
+            
+            self.log('debug', f'Using hostname for container communication: {hostname}')
+            self.api_url = f'http://{hostname}:{self._container_port}'
+        except Exception as e:
+            self.log('warning', f'Failed to determine container hostname: {str(e)}, falling back to localhost')
+            self.api_url = f'http://localhost:{self._container_port}'
 
         if not use_host_network:
-            # Ensure we bind to localhost first for better security
+            # Ensure we bind to localhost first for better security and accessibility
             bind_address = self.config.sandbox.runtime_binding_address or '127.0.0.1'
             port_mapping = {
                 f'{self._container_port}/tcp': [
@@ -318,15 +376,13 @@ class DockerRuntime(ActionExecutionClient):
             'HOST_HOSTNAME': 'host.docker.internal',  # Ensure host hostname is set
             'DOCKER_DEFAULT_PLATFORM': self.config.sandbox.platform or 'linux/amd64',
             'DOCKER_BUILDKIT': '1',
+            'DOCKER_DNS': '8.8.8.8',  # Fallback DNS server
         }
         
         if self.config.debug or DEBUG:
             environment['DEBUG'] = 'true'
             environment['DOCKER_BUILDKIT_PROGRESS'] = 'plain'
             
-        # Add host.docker.internal mapping for non-Windows platforms
-        extra_hosts = {'host.docker.internal': 'host-gateway'}
-        
         # also update with runtime_startup_env_vars
         environment.update(self.config.sandbox.runtime_startup_env_vars)
 
